@@ -1,0 +1,139 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum Role {
+  ADMIN
+  EMPLOYEE
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum TaskStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  WAITING_APPROVAL
+  COMPLETED
+  OVERDUE
+}
+
+enum NotificationType {
+  TASK_ASSIGNED
+  TASK_COMPLETED
+  TASK_OVERDUE
+  TASK_COMMENTED
+  EMPLOYEE_CREATED
+  TASK_UPDATED
+  PASSWORD_RESET
+}
+
+model User {
+  id                String    @id @default(uuid())
+  username          String    @unique
+  email             String    @unique
+  passwordHash      String
+  role              Role      @default(EMPLOYEE)
+  firstName         String
+  lastName          String
+  phone             String?
+  avatar            String?
+  isActive          Boolean   @default(true)
+  mustChangePassword Boolean  @default(true)
+  lastLogin         DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  assignedTasks     Task[]    @relation("AssignedTo")
+  createdTasks      Task[]    @relation("CreatedBy")
+  comments          TaskComment[]
+  notifications     Notification[] @relation("NotifRecipient")
+  sentNotifications Notification[] @relation("NotifSender")
+  activityLogs      ActivityLog[]
+}
+
+model Task {
+  id           String       @id @default(uuid())
+  title        String
+  description  String?
+  priority     TaskPriority @default(MEDIUM)
+  status       TaskStatus   @default(NOT_STARTED)
+  dueAt        DateTime
+  notes        String?
+  completedAt  DateTime?
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  assignedToId String
+  assignedTo   User         @relation("AssignedTo", fields: [assignedToId], references: [id])
+  createdById  String
+  createdBy    User         @relation("CreatedBy", fields: [createdById], references: [id])
+
+  comments     TaskComment[]
+  attachments  TaskAttachment[]
+  activityLogs ActivityLog[]
+  notifications Notification[]
+}
+
+model TaskComment {
+  id        String   @id @default(uuid())
+  content   String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  taskId    String
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  authorId  String
+  author    User     @relation(fields: [authorId], references: [id])
+}
+
+model TaskAttachment {
+  id           String   @id @default(uuid())
+  filename     String
+  url          String
+  mimeType     String?
+  size         Int?
+  createdAt    DateTime @default(now())
+
+  taskId       String
+  task         Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+}
+
+model Notification {
+  id          String           @id @default(uuid())
+  type        NotificationType
+  title       String
+  message     String
+  isRead      Boolean          @default(false)
+  createdAt   DateTime         @default(now())
+
+  recipientId String
+  recipient   User             @relation("NotifRecipient", fields: [recipientId], references: [id])
+  senderId    String?
+  sender      User?            @relation("NotifSender", fields: [senderId], references: [id])
+  taskId      String?
+  task        Task?            @relation(fields: [taskId], references: [id], onDelete: SetNull)
+}
+
+model ActivityLog {
+  id          String   @id @default(uuid())
+  action      String
+  description String
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  userId      String
+  user        User     @relation(fields: [userId], references: [id])
+  taskId      String?
+  task        Task?    @relation(fields: [taskId], references: [id], onDelete: SetNull)
+}
