@@ -21,44 +21,44 @@ export async function getDashboardStats(req: AuthRequest, res: Response) {
     ]);
     const overdue = await prisma.task.count({ where: { status: { not: 'COMPLETED' }, dueAt: { lt: now } } });
 
-    // Weekly chart (last 7 days)
+    // Weekly chart (last 7 days) — 2 queries instead of 14
+    const weekStart = new Date(); weekStart.setDate(weekStart.getDate() - 6); weekStart.setHours(0, 0, 0, 0);
+    const [weekTasks, priorityGroups, statusGroups, employees, empTaskGroups] = await Promise.all([
+      prisma.task.findMany({ where: { OR: [{ createdAt: { gte: weekStart } }, { completedAt: { gte: weekStart } }] }, select: { createdAt: true, completedAt: true } }),
+      prisma.task.groupBy({ by: ['priority'], _count: true }),
+      prisma.task.groupBy({ by: ['status'], _count: true }),
+      prisma.user.findMany({ where: { role: 'EMPLOYEE', isActive: true }, select: { id: true, firstName: true, lastName: true, username: true } }),
+      prisma.task.groupBy({ by: ['assignedToId', 'status'], _count: true }),
+    ]);
+
     const last7 = Array.from({ length: 7 }, (_, i) => {
       const d = new Date(); d.setDate(d.getDate() - (6 - i)); d.setHours(0, 0, 0, 0); return d;
     });
-    const weeklyChart = await Promise.all(last7.map(async (day) => {
+    const weeklyChart = last7.map((day) => {
       const next = new Date(day); next.setDate(next.getDate() + 1);
-      const [completed, assigned] = await Promise.all([
-        prisma.task.count({ where: { completedAt: { gte: day, lt: next } } }),
-        prisma.task.count({ where: { createdAt: { gte: day, lt: next } } }),
-      ]);
-      return { day: day.toLocaleDateString('en-US', { weekday: 'short' }), completed, assigned };
+      return {
+        day: day.toLocaleDateString('en-US', { weekday: 'short' }),
+        completed: weekTasks.filter(t => t.completedAt && t.completedAt >= day && t.completedAt < next).length,
+        assigned: weekTasks.filter(t => t.createdAt >= day && t.createdAt < next).length,
+      };
+    });
+
+    const priorityBreakdown = ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'].map(p => ({
+      priority: p, count: priorityGroups.find(g => g.priority === p)?._count ?? 0,
     }));
 
-    // Priority breakdown
-    const priorityBreakdown = await Promise.all(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'].map(async (p) => ({
-      priority: p,
-      count: await prisma.task.count({ where: { priority: p as any } }),
-    })));
-
-    // Status distribution
-    const statusDistribution = await Promise.all(['NOT_STARTED', 'IN_PROGRESS', 'WAITING_APPROVAL', 'COMPLETED'].map(async (s) => ({
-      status: s,
-      count: await prisma.task.count({ where: { status: s as any } }),
-    })));
+    const statusDistribution = ['NOT_STARTED', 'IN_PROGRESS', 'WAITING_APPROVAL', 'COMPLETED'].map(s => ({
+      status: s, count: statusGroups.find(g => g.status === s)?._count ?? 0,
+    }));
     statusDistribution.push({ status: 'OVERDUE', count: overdue });
 
-    // Top employees by completion rate
-    const employees = await prisma.user.findMany({
-      where: { role: 'EMPLOYEE', isActive: true },
-      select: { id: true, firstName: true, lastName: true, username: true },
-    });
-    const topEmployees = (await Promise.all(employees.map(async (emp) => {
-      const [totalTasks, completedTasks] = await Promise.all([
-        prisma.task.count({ where: { assignedToId: emp.id } }),
-        prisma.task.count({ where: { assignedToId: emp.id, status: 'COMPLETED' } }),
-      ]);
+    // Top employees by completion rate — computed from one groupBy
+    const topEmployees = employees.map((emp) => {
+      const groups = empTaskGroups.filter(g => g.assignedToId === emp.id);
+      const totalTasks = groups.reduce((s, g) => s + g._count, 0);
+      const completedTasks = groups.find(g => g.status === 'COMPLETED')?._count ?? 0;
       return { ...emp, totalTasks, completedTasks, score: totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0 };
-    }))).sort((a, b) => b.score - a.score);
+    }).sort((a, b) => b.score - a.score);
 
     res.json({ stats: { totalEmployees, totalTasks, completedToday, overdue }, weeklyChart, priorityBreakdown, statusDistribution, topEmployees });
   } catch (err) {
@@ -88,10 +88,10 @@ export async function getEmployees(req: AuthRequest, res: Response) {
       orderBy: { createdAt: 'desc' },
     });
 
-    const now = new Date();
-    const enriched = await Promise.all(employees.map(async (emp) => {
-      const completedTasks = await prisma.task.count({ where: { assignedToId: emp.id, status: 'COMPLETED' } });
-      return { ...emp, completedTasks };
+    const completedGroups = await prisma.task.groupBy({ by: ['assignedToId'], where: { status: 'COMPLETED' }, _count: true });
+    const enriched = employees.map((emp) => ({
+      ...emp,
+      completedTasks: completedGroups.find(g => g.assignedToId === emp.id)?._count ?? 0,
     }));
 
     res.json({ employees: enriched });
