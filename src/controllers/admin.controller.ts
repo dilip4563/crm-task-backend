@@ -101,16 +101,34 @@ export async function getEmployees(req: AuthRequest, res: Response) {
   }
 }
 
+function generatePassword(): string {
+  const upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+  const lower = 'abcdefghjkmnpqrstuvwxyz';
+  const digits = '23456789';
+  const symbols = '@#$!';
+  const pick = (set: string, n: number) => Array.from({ length: n }, () => set[Math.floor(Math.random() * set.length)]).join('');
+  return pick(upper, 2) + pick(lower, 4) + pick(digits, 3) + pick(symbols, 1);
+}
+
+async function generateEmployeeId(): Promise<string> {
+  const count = await prisma.user.count({ where: { role: 'EMPLOYEE' } });
+  let seq = count + 1;
+  // ensure uniqueness in case of gaps/deletions
+  while (await prisma.user.findUnique({ where: { username: `emp${String(seq).padStart(4, '0')}` } })) seq++;
+  return `emp${String(seq).padStart(4, '0')}`;
+}
+
 export async function createEmployee(req: AuthRequest, res: Response) {
   try {
-    const { username, email, firstName, lastName, phone, password, department, position } = req.body;
-    if (!username || !email || !firstName || !lastName) return res.status(400).json({ error: 'Missing required fields' });
+    const { email, firstName, lastName, phone } = req.body;
+    if (!email || !firstName || !lastName) return res.status(400).json({ error: 'Missing required fields' });
 
-    const defaultPassword = password || 'Employee@123';
-    const hash = await bcrypt.hash(defaultPassword, 12);
+    const username = await generateEmployeeId();
+    const generatedPassword = generatePassword();
+    const hash = await bcrypt.hash(generatedPassword, 12);
 
     const employee = await prisma.user.create({
-      data: { username: username.toLowerCase(), email: email.toLowerCase(), passwordHash: hash, firstName, lastName, phone, role: 'EMPLOYEE', mustChangePassword: true },
+      data: { username, email: email.toLowerCase(), passwordHash: hash, firstName, lastName, phone, role: 'EMPLOYEE', mustChangePassword: true },
       select: { id: true, username: true, email: true, firstName: true, lastName: true, phone: true, isActive: true, createdAt: true },
     });
 
@@ -126,9 +144,9 @@ export async function createEmployee(req: AuthRequest, res: Response) {
       emitToUser(io, admin.id, 'notification', notif);
     }
 
-    res.status(201).json({ employee, defaultPassword });
+    res.status(201).json({ employee, credentials: { userId: username, password: generatedPassword } });
   } catch (err: any) {
-    if (err.code === 'P2002') return res.status(409).json({ error: 'Username or email already exists' });
+    if (err.code === 'P2002') return res.status(409).json({ error: 'Email already exists' });
     res.status(500).json({ error: 'Failed to create employee' });
   }
 }
