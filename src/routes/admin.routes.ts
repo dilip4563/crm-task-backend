@@ -8,7 +8,7 @@ router.use(authenticate, requireAdmin);
 router.get('/dashboard', getDashboardStats);
 router.get('/assignees', getAssignees);
 router.get('/employees', getEmployees);
-router.post('/employees', createEmployee);
+router.post('/employees', requireSuperAdmin, createEmployee);
 router.put('/employees/:id', updateEmployee);
 router.post('/employees/:id/reset-password', resetEmployeePassword);
 router.get('/employees/:id/activity', getEmployeeActivity);
