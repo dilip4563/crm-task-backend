@@ -23,6 +23,8 @@ export async function getTasks(req: AuthRequest, res: Response) {
     const now = new Date();
     const where: any = {};
     if (req.user!.role === 'EMPLOYEE') where.assignedToId = req.user!.id;
+    // ADMIN sees only their team's tasks + tasks they created; SUPER_ADMIN sees all
+    if (req.user!.role === 'ADMIN') where.AND = [{ OR: [{ assignedTo: { managerId: req.user!.id } }, { createdById: req.user!.id }] }];
     if (status) where.status = status;
     if (priority) where.priority = priority;
     if (assignedTo) where.assignedToId = assignedTo;
@@ -89,6 +91,15 @@ export async function createTask(req: AuthRequest, res: Response) {
   try {
     const { title, description, priority, dueDate, dueTime, dueAt: dueAtRaw, assignedToId, notes } = req.body;
     if (!title || !assignedToId) return res.status(400).json({ error: 'Missing required fields' });
+
+    // Hierarchy rules: SUPER_ADMIN can assign to anyone; ADMIN only to their own employees
+    const assignee = await prisma.user.findUnique({ where: { id: assignedToId }, select: { role: true, managerId: true } });
+    if (!assignee) return res.status(404).json({ error: 'Assignee not found' });
+    if (req.user!.role === 'ADMIN') {
+      if (assignee.role !== 'EMPLOYEE' || assignee.managerId !== req.user!.id) {
+        return res.status(403).json({ error: 'You can only assign tasks to your own team members' });
+      }
+    }
 
     let dueAt: Date;
     if (dueAtRaw) {

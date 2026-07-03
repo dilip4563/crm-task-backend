@@ -9,6 +9,7 @@ datasource db {
 }
 
 enum Role {
+  SUPER_ADMIN
   ADMIN
   EMPLOYEE
 }
@@ -48,6 +49,11 @@ model User {
   lastName          String
   phone             String?
   avatar            String?
+  department        String?
+
+  managerId         String?
+  manager           User?     @relation("Team", fields: [managerId], references: [id])
+  teamMembers       User[]    @relation("Team")
   isActive          Boolean   @default(true)
   mustChangePassword Boolean  @default(true)
   lastLogin         DateTime?

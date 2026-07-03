@@ -1,11 +1,23 @@
 import { Response } from 'express';
 import bcrypt from 'bcryptjs';
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient, Prisma } from '@prisma/client';
 import { AuthRequest } from '../middleware/auth.middleware';
 import { io } from '../index';
 import { emitToUser } from '../services/socket.service';
 
 const prisma = new PrismaClient();
+
+const isSuper = (req: AuthRequest) => req.user?.role === 'SUPER_ADMIN';
+
+/** Employees visible to the requester: all for SUPER_ADMIN, own team for ADMIN */
+function teamFilter(req: AuthRequest): Prisma.UserWhereInput {
+  return isSuper(req) ? { role: 'EMPLOYEE' } : { role: 'EMPLOYEE', managerId: req.user!.id };
+}
+
+/** Task scope: everything for SUPER_ADMIN; own team's tasks + own created for ADMIN */
+function taskFilter(req: AuthRequest): Prisma.TaskWhereInput {
+  return isSuper(req) ? {} : { OR: [{ assignedTo: { managerId: req.user!.id } }, { createdById: req.user!.id }] };
+}
 
 // ── Dashboard Stats ──────────────────────────────────────────────
 export async function getDashboardStats(req: AuthRequest, res: Response) {
@@ -13,22 +25,20 @@ export async function getDashboardStats(req: AuthRequest, res: Response) {
     const now = new Date();
     const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
     const todayEnd = new Date(); todayEnd.setHours(23, 59, 59, 999);
+    const tf = taskFilter(req);
 
-    const [totalEmployees, totalTasks, completedToday] = await Promise.all([
-      prisma.user.count({ where: { role: 'EMPLOYEE', isActive: true } }),
-      prisma.task.count(),
-      prisma.task.count({ where: { status: 'COMPLETED', completedAt: { gte: todayStart, lte: todayEnd } } }),
+    const [totalEmployees, totalTasks, completedToday, overdue] = await Promise.all([
+      prisma.user.count({ where: { ...teamFilter(req), isActive: true } }),
+      prisma.task.count({ where: tf }),
+      prisma.task.count({ where: { ...tf, status: 'COMPLETED', completedAt: { gte: todayStart, lte: todayEnd } } }),
+      prisma.task.count({ where: { ...tf, status: { not: 'COMPLETED' }, dueAt: { lt: now } } }),
     ]);
-    const overdue = await prisma.task.count({ where: { status: { not: 'COMPLETED' }, dueAt: { lt: now } } });
 
-    // Weekly chart (last 7 days) — 2 queries instead of 14
     const weekStart = new Date(); weekStart.setDate(weekStart.getDate() - 6); weekStart.setHours(0, 0, 0, 0);
-    const [weekTasks, priorityGroups, statusGroups, employees, empTaskGroups] = await Promise.all([
-      prisma.task.findMany({ where: { OR: [{ createdAt: { gte: weekStart } }, { completedAt: { gte: weekStart } }] }, select: { createdAt: true, completedAt: true } }),
-      prisma.task.groupBy({ by: ['priority'], _count: true }),
-      prisma.task.groupBy({ by: ['status'], _count: true }),
-      prisma.user.findMany({ where: { role: 'EMPLOYEE', isActive: true }, select: { id: true, firstName: true, lastName: true, username: true } }),
-      prisma.task.groupBy({ by: ['assignedToId', 'status'], _count: true }),
+    const [weekTasks, allTasks, employees] = await Promise.all([
+      prisma.task.findMany({ where: { ...tf, OR: [{ createdAt: { gte: weekStart } }, { completedAt: { gte: weekStart } }] }, select: { createdAt: true, completedAt: true } }),
+      prisma.task.findMany({ where: tf, select: { priority: true, status: true, assignedToId: true } }),
+      prisma.user.findMany({ where: { ...teamFilter(req), isActive: true }, select: { id: true, firstName: true, lastName: true, username: true } }),
     ]);
 
     const last7 = Array.from({ length: 7 }, (_, i) => {
@@ -44,20 +54,18 @@ export async function getDashboardStats(req: AuthRequest, res: Response) {
     });
 
     const priorityBreakdown = ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'].map(p => ({
-      priority: p, count: priorityGroups.find(g => g.priority === p)?._count ?? 0,
+      priority: p, count: allTasks.filter(t => t.priority === p).length,
     }));
 
     const statusDistribution = ['NOT_STARTED', 'IN_PROGRESS', 'WAITING_APPROVAL', 'COMPLETED'].map(s => ({
-      status: s, count: statusGroups.find(g => g.status === s)?._count ?? 0,
+      status: s, count: allTasks.filter(t => t.status === s).length,
     }));
     statusDistribution.push({ status: 'OVERDUE', count: overdue });
 
-    // Top employees by completion rate — computed from one groupBy
     const topEmployees = employees.map((emp) => {
-      const groups = empTaskGroups.filter(g => g.assignedToId === emp.id);
-      const totalTasks = groups.reduce((s, g) => s + g._count, 0);
-      const completedTasks = groups.find(g => g.status === 'COMPLETED')?._count ?? 0;
-      return { ...emp, totalTasks, completedTasks, score: totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0 };
+      const empTasks = allTasks.filter(t => t.assignedToId === emp.id);
+      const completedTasks = empTasks.filter(t => t.status === 'COMPLETED').length;
+      return { ...emp, totalTasks: empTasks.length, completedTasks, score: empTasks.length > 0 ? Math.round((completedTasks / empTasks.length) * 100) : 0 };
     }).sort((a, b) => b.score - a.score);
 
     res.json({ stats: { totalEmployees, totalTasks, completedToday, overdue }, weeklyChart, priorityBreakdown, statusDistribution, topEmployees });
@@ -73,7 +81,7 @@ export async function getEmployees(req: AuthRequest, res: Response) {
     const { search, isActive } = req.query;
     const employees = await prisma.user.findMany({
       where: {
-        role: 'EMPLOYEE',
+        ...teamFilter(req),
         ...(isActive !== undefined && { isActive: isActive === 'true' }),
         ...(search && {
           OR: [
@@ -84,7 +92,7 @@ export async function getEmployees(req: AuthRequest, res: Response) {
           ],
         }),
       },
-      select: { id: true, username: true, email: true, firstName: true, lastName: true, phone: true, isActive: true, lastLogin: true, createdAt: true, mustChangePassword: true, _count: { select: { assignedTasks: true } } },
+      select: { id: true, username: true, email: true, firstName: true, lastName: true, phone: true, department: true, isActive: true, lastLogin: true, createdAt: true, mustChangePassword: true, manager: { select: { firstName: true, lastName: true, department: true } }, _count: { select: { assignedTasks: true } } },
       orderBy: { createdAt: 'desc' },
     });
 
@@ -110,55 +118,160 @@ function generatePassword(): string {
   return pick(upper, 2) + pick(lower, 4) + pick(digits, 3) + pick(symbols, 1);
 }
 
-async function generateEmployeeId(): Promise<string> {
-  const count = await prisma.user.count({ where: { role: 'EMPLOYEE' } });
+async function generateUserId(prefix: string, role: 'EMPLOYEE' | 'ADMIN'): Promise<string> {
+  const count = await prisma.user.count({ where: { role } });
   let seq = count + 1;
-  // ensure uniqueness in case of gaps/deletions
-  while (await prisma.user.findUnique({ where: { username: `emp${String(seq).padStart(4, '0')}` } })) seq++;
-  return `emp${String(seq).padStart(4, '0')}`;
+  while (await prisma.user.findUnique({ where: { username: `${prefix}${String(seq).padStart(4, '0')}` } })) seq++;
+  return `${prefix}${String(seq).padStart(4, '0')}`;
 }
 
 export async function createEmployee(req: AuthRequest, res: Response) {
   try {
-    const { email, firstName, lastName, phone } = req.body;
+    const { email, firstName, lastName, phone, managerId } = req.body;
     if (!email || !firstName || !lastName) return res.status(400).json({ error: 'Missing required fields' });
 
-    const username = await generateEmployeeId();
+    // ADMIN creates employees under themselves; SUPER_ADMIN can pick a manager (or none)
+    let assignedManagerId: string | null = null;
+    if (isSuper(req)) {
+      assignedManagerId = managerId || null;
+    } else {
+      assignedManagerId = req.user!.id;
+    }
+
+    // Inherit department from manager
+    let department: string | null = req.body.department || null;
+    if (assignedManagerId && !department) {
+      const mgr = await prisma.user.findUnique({ where: { id: assignedManagerId }, select: { department: true } });
+      department = mgr?.department || null;
+    }
+
+    const username = await generateUserId('emp', 'EMPLOYEE');
     const generatedPassword = generatePassword();
     const hash = await bcrypt.hash(generatedPassword, 12);
 
     const employee = await prisma.user.create({
-      data: { username, email: email.toLowerCase(), passwordHash: hash, firstName, lastName, phone, role: 'EMPLOYEE', mustChangePassword: true },
-      select: { id: true, username: true, email: true, firstName: true, lastName: true, phone: true, isActive: true, createdAt: true },
+      data: { username, email: email.toLowerCase(), passwordHash: hash, firstName, lastName, phone, department, role: 'EMPLOYEE', managerId: assignedManagerId, mustChangePassword: true },
+      select: { id: true, username: true, email: true, firstName: true, lastName: true, phone: true, department: true, isActive: true, createdAt: true },
     });
 
     await prisma.activityLog.create({
-      data: { action: 'EMPLOYEE_CREATED', description: `Admin created employee ${username}`, userId: req.user!.id },
+      data: { action: 'EMPLOYEE_CREATED', description: `${req.user!.username} created employee ${username}`, userId: req.user!.id },
     });
 
-    const admins = await prisma.user.findMany({ where: { role: 'ADMIN' } });
-    for (const admin of admins) {
+    // Notify super admins + the manager
+    const notifyIds = new Set<string>();
+    const supers = await prisma.user.findMany({ where: { role: 'SUPER_ADMIN' }, select: { id: true } });
+    supers.forEach(s => notifyIds.add(s.id));
+    if (assignedManagerId) notifyIds.add(assignedManagerId);
+    notifyIds.delete(req.user!.id);
+    for (const id of notifyIds) {
       const notif = await prisma.notification.create({
-        data: { type: 'EMPLOYEE_CREATED', title: 'New Employee Created', message: `${firstName} ${lastName} has been added to the system`, recipientId: admin.id, senderId: req.user!.id },
+        data: { type: 'EMPLOYEE_CREATED', title: 'New Employee Created', message: `${firstName} ${lastName} has been added to the system`, recipientId: id, senderId: req.user!.id },
       });
-      emitToUser(io, admin.id, 'notification', notif);
+      emitToUser(io, id, 'notification', notif);
     }
 
     res.status(201).json({ employee, credentials: { userId: username, password: generatedPassword } });
   } catch (err: any) {
     if (err.code === 'P2002') return res.status(409).json({ error: 'Email already exists' });
+    console.error(err);
     res.status(500).json({ error: 'Failed to create employee' });
+  }
+}
+
+/** Users the requester is allowed to assign tasks to */
+export async function getAssignees(req: AuthRequest, res: Response) {
+  try {
+    const { search } = req.query;
+    const searchFilter = search ? {
+      OR: [
+        { firstName: { contains: search as string, mode: 'insensitive' as const } },
+        { lastName: { contains: search as string, mode: 'insensitive' as const } },
+        { username: { contains: search as string, mode: 'insensitive' as const } },
+      ],
+    } : {};
+
+    const where: Prisma.UserWhereInput = isSuper(req)
+      ? { isActive: true, role: { in: ['ADMIN', 'EMPLOYEE'] }, ...searchFilter }
+      : { isActive: true, role: 'EMPLOYEE', managerId: req.user!.id, ...searchFilter };
+
+    const assignees = await prisma.user.findMany({
+      where,
+      select: { id: true, username: true, firstName: true, lastName: true, role: true, department: true },
+      orderBy: [{ role: 'asc' }, { firstName: 'asc' }],
+      take: 20,
+    });
+    res.json({ assignees });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch assignees' });
+  }
+}
+
+// ── Admin management (SUPER_ADMIN only) ──────────────────────────
+export async function getAdmins(req: AuthRequest, res: Response) {
+  try {
+    const admins = await prisma.user.findMany({
+      where: { role: 'ADMIN' },
+      select: { id: true, username: true, email: true, firstName: true, lastName: true, phone: true, department: true, isActive: true, lastLogin: true, createdAt: true, _count: { select: { teamMembers: true, assignedTasks: true } } },
+      orderBy: { createdAt: 'desc' },
+    });
+    res.json({ admins });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch admins' });
+  }
+}
+
+export async function createAdmin(req: AuthRequest, res: Response) {
+  try {
+    const { email, firstName, lastName, phone, department } = req.body;
+    if (!email || !firstName || !lastName || !department) return res.status(400).json({ error: 'Missing required fields (department is required for admins)' });
+
+    const username = await generateUserId('adm', 'ADMIN');
+    const generatedPassword = generatePassword();
+    const hash = await bcrypt.hash(generatedPassword, 12);
+
+    const admin = await prisma.user.create({
+      data: { username, email: email.toLowerCase(), passwordHash: hash, firstName, lastName, phone, department, role: 'ADMIN', mustChangePassword: true },
+      select: { id: true, username: true, email: true, firstName: true, lastName: true, department: true, isActive: true, createdAt: true },
+    });
+
+    await prisma.activityLog.create({
+      data: { action: 'ADMIN_CREATED', description: `Super admin created admin ${username} (${department})`, userId: req.user!.id },
+    });
+
+    res.status(201).json({ admin, credentials: { userId: username, password: generatedPassword } });
+  } catch (err: any) {
+    if (err.code === 'P2002') return res.status(409).json({ error: 'Email already exists' });
+    console.error(err);
+    res.status(500).json({ error: 'Failed to create admin' });
   }
 }
 
 export async function updateEmployee(req: AuthRequest, res: Response) {
   try {
     const { id } = req.params;
-    const { firstName, lastName, phone, email, isActive } = req.body;
+    const { firstName, lastName, phone, email, isActive, department, managerId } = req.body;
+
+    // Admins can only update their own team members
+    if (!isSuper(req)) {
+      const target = await prisma.user.findUnique({ where: { id }, select: { managerId: true, role: true } });
+      if (!target || target.role !== 'EMPLOYEE' || target.managerId !== req.user!.id) {
+        return res.status(403).json({ error: 'You can only manage your own team members' });
+      }
+    }
+
     const employee = await prisma.user.update({
-      where: { id, role: 'EMPLOYEE' },
-      data: { ...(firstName && { firstName }), ...(lastName && { lastName }), ...(phone !== undefined && { phone }), ...(email && { email }), ...(isActive !== undefined && { isActive }) },
-      select: { id: true, username: true, email: true, firstName: true, lastName: true, phone: true, isActive: true },
+      where: { id },
+      data: {
+        ...(firstName && { firstName }), ...(lastName && { lastName }),
+        ...(phone !== undefined && { phone }), ...(email && { email }),
+        ...(isActive !== undefined && { isActive }),
+        ...(department !== undefined && { department }),
+        ...(isSuper(req) && managerId !== undefined && { managerId: managerId || null }),
+      },
+      select: { id: true, username: true, email: true, firstName: true, lastName: true, phone: true, department: true, isActive: true },
     });
     res.json(employee);
   } catch {
@@ -169,11 +282,19 @@ export async function updateEmployee(req: AuthRequest, res: Response) {
 export async function resetEmployeePassword(req: AuthRequest, res: Response) {
   try {
     const { id } = req.params;
+
+    if (!isSuper(req)) {
+      const target = await prisma.user.findUnique({ where: { id }, select: { managerId: true, role: true } });
+      if (!target || target.role !== 'EMPLOYEE' || target.managerId !== req.user!.id) {
+        return res.status(403).json({ error: 'You can only manage your own team members' });
+      }
+    }
+
     const tempPassword = 'Reset@' + Math.random().toString(36).slice(2, 8).toUpperCase();
     const hash = await bcrypt.hash(tempPassword, 12);
     await prisma.user.update({ where: { id }, data: { passwordHash: hash, mustChangePassword: true } });
-    await prisma.activityLog.create({ data: { action: 'PASSWORD_RESET', description: `Admin reset password for employee ${id}`, userId: req.user!.id } });
-    res.json({ tempPassword, message: 'Password reset. Employee must change on next login.' });
+    await prisma.activityLog.create({ data: { action: 'PASSWORD_RESET', description: `${req.user!.username} reset password for user ${id}`, userId: req.user!.id } });
+    res.json({ tempPassword, message: 'Password reset. User must change on next login.' });
   } catch {
     res.status(500).json({ error: 'Failed to reset password' });
   }
@@ -204,17 +325,16 @@ export async function getReports(req: AuthRequest, res: Response) {
     else { from = new Date(now); from.setDate(now.getDate() - 7); }
 
     const [tasks, employees] = await Promise.all([
-      prisma.task.findMany({ where: { createdAt: { gte: from } } }),
-      prisma.user.findMany({ where: { role: 'EMPLOYEE', isActive: true }, select: { id: true, firstName: true, lastName: true } }),
+      prisma.task.findMany({ where: { ...taskFilter(req), createdAt: { gte: from } } }),
+      prisma.user.findMany({ where: { ...teamFilter(req), isActive: true }, select: { id: true, firstName: true, lastName: true } }),
     ]);
 
     const totalCompleted = tasks.filter(t => t.status === 'COMPLETED').length;
     const totalOverdue = tasks.filter(t => t.status !== 'COMPLETED' && t.dueAt < now).length;
     const completionRate = tasks.length > 0 ? Math.round((totalCompleted / tasks.length) * 100) : 0;
 
-    // Chart data (daily breakdown over period)
     const days = period === 'daily' ? 1 : period === 'monthly' ? 30 : 7;
-    const chart = await Promise.all(Array.from({ length: days }, (_, i) => {
+    const chart = Array.from({ length: days }, (_, i) => {
       const day = new Date(from); day.setDate(day.getDate() + i); day.setHours(0, 0, 0, 0);
       const next = new Date(day); next.setDate(next.getDate() + 1);
       const dayTasks = tasks.filter(t => t.createdAt >= day && t.createdAt < next);
@@ -223,9 +343,9 @@ export async function getReports(req: AuthRequest, res: Response) {
         assigned: dayTasks.length,
         completed: dayTasks.filter(t => t.status === 'COMPLETED').length,
       };
-    }));
+    });
 
-    const employeePerformance = await Promise.all(employees.map(async (emp) => {
+    const employeePerformance = employees.map((emp) => {
       const empTasks = tasks.filter(t => t.assignedToId === emp.id);
       return {
         ...emp,
@@ -233,7 +353,7 @@ export async function getReports(req: AuthRequest, res: Response) {
         completed: empTasks.filter(t => t.status === 'COMPLETED').length,
         overdue: empTasks.filter(t => t.status !== 'COMPLETED' && t.dueAt < now).length,
       };
-    }));
+    });
 
     res.json({ summary: { totalAssigned: tasks.length, totalCompleted, totalOverdue, completionRate }, chart, employeePerformance });
   } catch (err) {
@@ -252,7 +372,7 @@ export async function exportReport(req: AuthRequest, res: Response) {
     else { from = new Date(now); from.setDate(now.getDate() - 7); }
 
     const tasks = await prisma.task.findMany({
-      where: { createdAt: { gte: from } },
+      where: { ...taskFilter(req), createdAt: { gte: from } },
       include: { assignedTo: { select: { firstName: true, lastName: true, username: true } } },
       orderBy: { createdAt: 'desc' },
     });
@@ -271,7 +391,6 @@ export async function exportReport(req: AuthRequest, res: Response) {
       return res.send(header + rows);
     }
 
-    // Fallback JSON for other formats
     res.json(tasks);
   } catch (err) {
     res.status(500).json({ error: 'Export failed' });
