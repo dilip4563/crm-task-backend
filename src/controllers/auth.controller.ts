@@ -3,6 +3,9 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { PrismaClient } from '@prisma/client';
 import { AuthRequest } from '../middleware/auth.middleware';
+import { officeToday } from './attendance.controller';
+import { io } from '../index';
+import { emitToUser } from '../services/socket.service';
 
 const prisma = new PrismaClient();
 
@@ -31,6 +34,36 @@ export async function login(req: Request, res: Response) {
       data: { action: 'LOGIN', description: `${user.username} logged in`, userId: user.id },
     });
 
+    // ── Attendance: record session (skip if one is already open today) ──
+    try {
+      const today = officeToday();
+      const openSession = await prisma.attendanceSession.findFirst({ where: { userId: user.id, date: today, logoutAt: null } });
+      if (!openSession) {
+        const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.socket.remoteAddress || null;
+        const device = (req.headers['user-agent'] as string)?.slice(0, 250) || null;
+        const isFirstToday = !(await prisma.attendanceSession.findFirst({ where: { userId: user.id, date: today } }));
+        await prisma.attendanceSession.create({ data: { userId: user.id, date: today, loginAt: new Date(), ip, device } });
+
+        // Late-arrival alert on first login of the day
+        if (isFirstToday) {
+          const settings = await prisma.workSettings.findUnique({ where: { id: 1 } });
+          const lateAfter = settings?.lateAfter || '09:45';
+          const nowHM = new Date().toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' });
+          if (nowHM > lateAfter && user.role === 'EMPLOYEE') {
+            const recipients = new Set<string>();
+            if (user.managerId) recipients.add(user.managerId);
+            (await prisma.user.findMany({ where: { role: 'SUPER_ADMIN' }, select: { id: true } })).forEach(u => recipients.add(u.id));
+            for (const id of recipients) {
+              const notif = await prisma.notification.create({
+                data: { type: 'ATTENDANCE_LATE', title: 'Late Arrival', message: `${user.firstName} ${user.lastName} logged in late at ${nowHM}`, recipientId: id, senderId: user.id },
+              });
+              emitToUser(io, id, 'notification', notif);
+            }
+          }
+        }
+      }
+    } catch (e) { console.error('attendance record failed', e); }
+
     const token = signToken({ id: user.id, role: user.role, username: user.username });
     return res.json({
       token,
@@ -43,6 +76,20 @@ export async function login(req: Request, res: Response) {
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: 'Login failed' });
+  }
+}
+
+export async function logout(req: AuthRequest, res: Response) {
+  try {
+    const today = officeToday();
+    const now = new Date();
+    // close open attendance session + open break
+    await prisma.attendanceSession.updateMany({ where: { userId: req.user!.id, date: today, logoutAt: null }, data: { logoutAt: now } });
+    await prisma.breakSession.updateMany({ where: { userId: req.user!.id, date: today, endAt: null }, data: { endAt: now } });
+    await prisma.activityLog.create({ data: { action: 'LOGOUT', description: `${req.user!.username} logged out`, userId: req.user!.id } });
+    return res.json({ message: 'Logged out' });
+  } catch {
+    return res.status(500).json({ error: 'Logout failed' });
   }
 }
 

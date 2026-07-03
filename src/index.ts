@@ -10,6 +10,7 @@ import adminRoutes from './routes/admin.routes';
 import employeeRoutes from './routes/employee.routes';
 import taskRoutes from './routes/task.routes';
 import notificationRoutes from './routes/notification.routes';
+import attendanceRoutes from './routes/attendance.routes';
 import { setupSocket } from './services/socket.service';
 
 dotenv.config();
@@ -40,6 +41,7 @@ app.use('/api/admin', adminRoutes);
 app.use('/api/employee', employeeRoutes);
 app.use('/api/tasks', taskRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/api/attendance', attendanceRoutes);
 
 app.get('/api/health', (_req, res) => res.json({ status: 'ok', env: process.env.NODE_ENV }));
 

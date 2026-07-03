@@ -37,6 +37,21 @@ enum NotificationType {
   EMPLOYEE_CREATED
   TASK_UPDATED
   PASSWORD_RESET
+  ATTENDANCE_LATE
+  CORRECTION_REQUEST
+  CORRECTION_REVIEWED
+}
+
+enum CorrectionType {
+  MISSED_LOGIN
+  MISSED_LOGOUT
+  WRONG_ENTRY
+}
+
+enum CorrectionStatus {
+  PENDING
+  APPROVED
+  REJECTED
 }
 
 model User {
@@ -66,6 +81,10 @@ model User {
   notifications     Notification[] @relation("NotifRecipient")
   sentNotifications Notification[] @relation("NotifSender")
   activityLogs      ActivityLog[]
+  attendanceSessions AttendanceSession[]
+  breakSessions      BreakSession[]
+  corrections        AttendanceCorrection[] @relation("CorrectionUser")
+  reviewedCorrections AttendanceCorrection[] @relation("CorrectionReviewer")
 }
 
 model Task {
@@ -129,6 +148,58 @@ model Notification {
   sender      User?            @relation("NotifSender", fields: [senderId], references: [id])
   taskId      String?
   task        Task?            @relation(fields: [taskId], references: [id], onDelete: SetNull)
+}
+
+model AttendanceSession {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id])
+  date      String    // YYYY-MM-DD (office local date)
+  loginAt   DateTime
+  logoutAt  DateTime?
+  ip        String?
+  device    String?
+  manual    Boolean   @default(false) // created via approved correction
+  createdAt DateTime  @default(now())
+
+  @@index([userId, date])
+}
+
+model BreakSession {
+  id      String    @id @default(uuid())
+  userId  String
+  user    User      @relation(fields: [userId], references: [id])
+  date    String
+  startAt DateTime
+  endAt   DateTime?
+
+  @@index([userId, date])
+}
+
+model AttendanceCorrection {
+  id               String           @id @default(uuid())
+  userId           String
+  user             User             @relation("CorrectionUser", fields: [userId], references: [id])
+  date             String
+  type             CorrectionType
+  requestedLoginAt  DateTime?
+  requestedLogoutAt DateTime?
+  reason           String
+  status           CorrectionStatus @default(PENDING)
+  reviewedById     String?
+  reviewedBy       User?            @relation("CorrectionReviewer", fields: [reviewedById], references: [id])
+  reviewedAt       DateTime?
+  createdAt        DateTime         @default(now())
+}
+
+model WorkSettings {
+  id           Int    @id @default(1)
+  workStart    String @default("09:30")
+  lateAfter    String @default("09:45")
+  workEnd      String @default("18:30")
+  fullDayHours Float  @default(8)
+  halfDayHours Float  @default(4)
+  timezone     String @default("Asia/Kolkata")
 }
 
 model ActivityLog {
