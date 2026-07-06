@@ -44,6 +44,15 @@ export async function login(req: Request, res: Response) {
         const isFirstToday = !(await prisma.attendanceSession.findFirst({ where: { userId: user.id, date: today } }));
         await prisma.attendanceSession.create({ data: { userId: user.id, date: today, loginAt: new Date(), ip, device } });
 
+        // Live presence: tell super admins + manager this user is now online
+        const presenceRecipients = new Set<string>();
+        if (user.managerId) presenceRecipients.add(user.managerId);
+        (await prisma.user.findMany({ where: { role: 'SUPER_ADMIN' }, select: { id: true } })).forEach(u => presenceRecipients.add(u.id));
+        presenceRecipients.delete(user.id);
+        for (const id of presenceRecipients) {
+          emitToUser(io, id, 'presence', { userId: user.id, name: `${user.firstName} ${user.lastName}`, online: true });
+        }
+
         // Late-arrival alert on first login of the day
         if (isFirstToday) {
           const settings = await prisma.workSettings.findUnique({ where: { id: 1 } });
@@ -87,6 +96,16 @@ export async function logout(req: AuthRequest, res: Response) {
     await prisma.attendanceSession.updateMany({ where: { userId: req.user!.id, date: today, logoutAt: null }, data: { logoutAt: now } });
     await prisma.breakSession.updateMany({ where: { userId: req.user!.id, date: today, endAt: null }, data: { endAt: now } });
     await prisma.activityLog.create({ data: { action: 'LOGOUT', description: `${req.user!.username} logged out`, userId: req.user!.id } });
+
+    // Live presence: broadcast offline
+    const me = await prisma.user.findUnique({ where: { id: req.user!.id }, select: { firstName: true, lastName: true, managerId: true } });
+    const recipients = new Set<string>();
+    if (me?.managerId) recipients.add(me.managerId);
+    (await prisma.user.findMany({ where: { role: 'SUPER_ADMIN' }, select: { id: true } })).forEach(u => recipients.add(u.id));
+    recipients.delete(req.user!.id);
+    for (const id of recipients) {
+      emitToUser(io, id, 'presence', { userId: req.user!.id, name: `${me?.firstName} ${me?.lastName}`, online: false });
+    }
     return res.json({ message: 'Logged out' });
   } catch {
     return res.status(500).json({ error: 'Logout failed' });

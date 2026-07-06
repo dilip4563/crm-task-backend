@@ -68,7 +68,22 @@ export async function getDashboardStats(req: AuthRequest, res: Response) {
       return { ...emp, totalTasks: empTasks.length, completedTasks, score: empTasks.length > 0 ? Math.round((completedTasks / empTasks.length) * 100) : 0 };
     }).sort((a, b) => b.score - a.score);
 
-    res.json({ stats: { totalEmployees, totalTasks, completedToday, overdue }, weeklyChart, priorityBreakdown, statusDistribution, topEmployees });
+    // Live: who is online right now (open attendance session today)
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    const userScope = isSuper(req) ? { role: { in: ['ADMIN', 'EMPLOYEE'] as any } } : { managerId: req.user!.id };
+    const openSessions = await prisma.attendanceSession.findMany({
+      where: { date: today, logoutAt: null, user: { ...userScope, isActive: true } },
+      include: { user: { select: { id: true, firstName: true, lastName: true, username: true, role: true, department: true } } },
+      orderBy: { loginAt: 'asc' },
+    });
+    const openBreaks = await prisma.breakSession.findMany({ where: { date: today, endAt: null }, select: { userId: true } });
+    const breakIds = new Set(openBreaks.map(b => b.userId));
+    const seen = new Set<string>();
+    const activeNow = openSessions.filter(s => !seen.has(s.userId) && seen.add(s.userId)).map(s => ({
+      ...s.user, loginAt: s.loginAt, onBreak: breakIds.has(s.userId),
+    }));
+
+    res.json({ stats: { totalEmployees, totalTasks, completedToday, overdue }, weeklyChart, priorityBreakdown, statusDistribution, topEmployees, activeNow });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to fetch dashboard stats' });
